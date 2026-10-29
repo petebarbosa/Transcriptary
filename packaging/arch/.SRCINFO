@@ -1,6 +1,6 @@
 pkgbase = transcriptary
 	pkgdesc = Record and transcribe your meetings locally, with speaker separation
-	pkgver = 0.3.5
+	pkgver = 0.3.6
 	pkgrel = 1
 	url = https://github.com/petebarbosa/Transcriptary
 	arch = x86_64
@@ -21,7 +21,7 @@ pkgbase = transcriptary
 	optdepends = xdg-utils: open links and folders from the app
 	options = !lto
 	options = !debug
-	source = transcriptary-0.3.5.tar.gz::https://github.com/petebarbosa/Transcriptary/archive/refs/tags/v0.3.5.tar.gz
-	sha256sums = d7ce0a1dc966b35f022d395fc0c0b2909400286b89e8100abbc42f68d9724bdc
+	source = transcriptary-0.3.6.tar.gz::https://github.com/petebarbosa/Transcriptary/archive/refs/tags/v0.3.6.tar.gz
+	sha256sums = 8fafd03943bf07722051ae3a55abdf64e3ae2c6cb86f64fe09b2c4ec1f899231
 
 pkgname = transcriptary
