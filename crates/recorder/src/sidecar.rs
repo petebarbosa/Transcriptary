@@ -33,7 +33,7 @@ pub struct Cut {
     pub at_unix_ms: i64,
     /// Duração da lacuna preenchida.
     pub gap_ms: u32,
-    /// `"read_error"` | `"device_changed"`.
+    /// `"read_error"` | `"device_changed"` | `"auto_switch"` (troca automática de saída do `sys`; não é falha).
     pub reason: String,
     /// `false` se a sessão acabou antes de conseguir religar.
     pub reconnected: bool,

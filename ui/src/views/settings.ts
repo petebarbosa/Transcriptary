@@ -22,7 +22,7 @@ const HYPR_LUA = `hl.window_rule({
 })
 hl.bind("CTRL + ALT + R", hl.dsp.exec_cmd("tary record toggle"))`
 
-const valueChoice = (v: string): StreamChoice => (v === 'default' || v === 'off' ? v : { named: v.slice(4) })
+const valueChoice = (v: string): StreamChoice => (v === 'auto' || v === 'off' ? v : { named: v.slice(4) })
 
 /** Atalho a partir de um keydown no formato do plugin (Ctrl+Alt+R). Exige modificador; só modificador não vale. */
 function accelFrom(e: KeyboardEvent): string | null {
@@ -56,7 +56,7 @@ export async function renderSettings(el: HTMLElement): Promise<View> {
     const inf = info
     const dev = (list: DeviceInfo[], cur: StreamChoice) => {
       const known = typeof cur === 'string' || list.some(d => d.name === cur.named)
-      return `<option value="default">${esc(t('record.dev_default'))}</option><option value="off">${esc(t('record.dev_off'))}</option>` +
+      return `<option value="auto">${esc(t('record.dev_auto'))}</option><option value="off">${esc(t('record.dev_off'))}</option>` +
         list.map(d => `<option value="dev:${esc(d.name)}">${esc(d.description || d.name)}${d.is_default ? ' · ' + esc(t('record.dev_is_default')) : ''}</option>`).join('') +
         (known ? '' : `<option value="dev:${esc((cur as { named: string }).named)}">${esc((cur as { named: string }).named)} · ${esc(t('record.dev_missing'))}</option>`)
     }

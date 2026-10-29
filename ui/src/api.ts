@@ -161,11 +161,15 @@ export interface Bootstrap {
 export interface ApiError { code: string; detail: string }
 
 // ---- gravação (fase 3; ver RECORDING_CONTRACT.md)
-/** 'default' = padrão do sistema; 'off' = não gravar esta trilha; { named } = dispositivo (DeviceInfo.name) */
-export type StreamChoice = 'default' | 'off' | { named: string }
+/** 'auto' = o shell escolhe (mic: padrão do sistema; sys: a saída que está tocando som); 'off' = não gravar esta trilha; { named } = dispositivo (DeviceInfo.name) */
+export type StreamChoice = 'auto' | 'off' | { named: string }
+/** o valor legado 'default' (versões antigas gravavam assim) vira 'auto'; o shell só devolve 'auto' */
+export const normChoice = (c: StreamChoice | 'default'): StreamChoice => (c === 'default' ? 'auto' : c)
 export interface DeviceInfo { name: string; description: string; is_monitor: boolean; is_default: boolean }
 export interface RecordDevices { backend: 'pulse' | 'fake' | 'unavailable'; devices: DeviceInfo[] }
-export interface StreamStatus { device: string; description: string; is_monitor: boolean; alive: boolean; samples: number; cuts: number }
+export interface StreamStatus { device: string; description: string; is_monitor: boolean; alive: boolean; samples: number; cuts: number
+  /** trocas automáticas de saída (sys em 'auto'); `cuts` conta só falhas reais */
+  switches: number }
 export interface RecordingInfo {
   key: string; started_at: string
   library_id: number; client_id: number | null; title: string; expected_speakers: number | null; language: string | null
@@ -192,7 +196,13 @@ export interface RecordInfo {
   bar_on_start: boolean
   last_used: LastUsed
 }
-export interface StreamLevel { peak: number; rms: number; silent_s: number; alive: boolean }
+/** `switch_ago_s` = segundos desde o início da última troca automática de saída desta trilha (`null` = nunca) */
+export interface StreamLevel { peak: number; rms: number; silent_s: number; alive: boolean; switch_ago_s: number | null }
+/** segundos de silêncio até o aviso âmbar (tela e barra): o mic cobra mais cedo; no sys o silêncio é normal quando o outro lado não fala */
+export const MIC_SILENCE_WARN_S = 3
+export const SYS_SILENCE_WARN_S = 10
+/** a troca dura ~150 ms e os níveis chegam a ~10 Hz: a nota "mudou para …" fica visível por tanto tempo */
+export const SWITCH_NOTE_S = 8
 /** evento 'record-levels' (~10 Hz) */
 export interface LevelsEvent { source: 'recording' | 'monitor'; elapsed_s: number | null; mic: StreamLevel | null; sys: StreamLevel | null }
 export interface Orphan {
@@ -398,7 +408,7 @@ export const api = {
   glossaryPromptTerms: (libraryId: number, clientId: number | null) =>
     call<PromptTerms>('glossary_prompt_terms', { libraryId, clientId }),
   // ---- gravação
-  recordInfo: () => call<RecordInfo>('record_info'),
+  recordInfo: () => call<RecordInfo>('record_info').then(i => ({ ...i, last_used: { ...i.last_used, mic: normChoice(i.last_used.mic), sys: normChoice(i.last_used.sys) } })),
   recordDevices: () => call<RecordDevices>('record_devices'),
   recordStatus: () => call<RecordStatus>('record_status'),
   recordStart: (a: RecordStartArgs = {}) =>
@@ -415,7 +425,7 @@ export const api = {
     }),
   recordStop: () => call<RecordStatus>('record_stop'),
   recordToggle: () => call<RecordStatus>('record_toggle'),
-  recordMonitorStart: (mic: StreamChoice = 'default', sys: StreamChoice = 'default') =>
+  recordMonitorStart: (mic: StreamChoice = 'auto', sys: StreamChoice = 'auto') =>
     call<void>('record_monitor_start', { mic, sys }),
   recordMonitorStop: () => call<void>('record_monitor_stop'),
   recordOrphans: () => call<Orphan[]>('record_orphans'),

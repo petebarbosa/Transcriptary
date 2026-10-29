@@ -2,7 +2,7 @@
 // Dados 100% sintéticos. Nunca é carregado dentro do Tauri.
 import { mockIPC } from '@tauri-apps/api/mocks'
 import { emit } from '@tauri-apps/api/event'
-import { TRANSCRIPTION_DEFAULTS } from './api'
+import { normChoice, TRANSCRIPTION_DEFAULTS } from './api'
 import type { ApplyReport, AudioDeletion, DeleteMode, Deletion, AudioEntry, BleedRemoval, BlockedBy, AudioCut, BlockChange, BlockInfo, BlocksChange, CutsChange, BlockSuggestion, CallDetail, ClientInfo, DeviceInfo, GlossaryImportEntry, HistoryEntry, Hit, JobInfo, JobKind, JobOptions, JobProgress, JobStage, LibraryInfo, LevelsEvent, ModelStatus, PauseReason, QueueStatus, Orphan, RecordingInfo, RecordStatus, Rule, SpeakerInfo, StreamChoice, StreamLevel, StreamStatus } from './api'
 
 type Args = Record<string, any>
@@ -644,7 +644,7 @@ const DEVICES: DeviceInfo[] = [
 ]
 const bad = (code: string, detail: string) => ({ code, detail })
 
-interface Track { dev: DeviceInfo; t0: number; silentSince: number | null; cuts: number }
+interface Track { dev: DeviceInfo; t0: number; silentSince: number | null; cuts: number; auto: boolean; switches: number; switchedAt: number | null }
 interface Active { key: string; started_at: string; startMs: number; intent: Intent; mic: Track | null; sys: Track | null }
 interface Intent { library_id: number; client_id: number | null; title: string; expected_speakers: number | null; language: string | null }
 const rec = {
@@ -655,37 +655,41 @@ const rec = {
   timer: undefined as ReturnType<typeof setInterval> | undefined,
   orphans: [] as Orphan[],
   lastCuts: 0,
+  lastSwitches: 0,
 }
 
 const pad = (n: number) => String(n).padStart(2, '0')
 const localIso = (d = new Date()) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
 const keyOf = (iso: string) => `call_${iso.slice(0, 10)}_${iso.slice(11).replace(/:/g, '-')}`
 const saveSettings = () => { try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings)) } catch {} }
-const parseChoice = (raw: string | undefined): StreamChoice => { try { return raw ? JSON.parse(raw) : 'default' } catch { return 'default' } }
+// como o shell: aceita 'default' (legado) e devolve sempre 'auto'
+const parseChoice = (raw: string | undefined): StreamChoice => { try { return normChoice(raw ? JSON.parse(raw) : 'auto') } catch { return 'auto' } }
 
 function resolveTrack(kind: 'mic' | 'sys', choice: StreamChoice | null | undefined): Track | null {
-  const c = choice ?? 'default'
+  const c = normChoice(choice ?? 'auto')
   if (c === 'off') return null
   const want = kind === 'sys'
-  const dev = c === 'default' ? DEVICES.find(d => d.is_monitor === want && d.is_default) : DEVICES.find(d => d.name === c.named && d.is_monitor === want)
-  if (!dev) throw bad('device_not_found', typeof c === 'string' ? 'default' : c.named)
-  return { dev, t0: Date.now(), silentSince: null, cuts: 0 }
+  const dev = c === 'auto' ? DEVICES.find(d => d.is_monitor === want && d.is_default) : DEVICES.find(d => d.name === c.named && d.is_monitor === want)
+  if (!dev) throw bad('device_not_found', typeof c === 'string' ? 'auto' : c.named)
+  return { dev, t0: Date.now(), silentSince: null, cuts: 0, auto: c === 'auto', switches: 0, switchedAt: null }
 }
 
 /** Nível sintético: mic = voz com pausas; monitor = rajadas; `silent` = zero; `flaky` cai entre 3 s e 4,5 s (um corte). */
 function levelOf(tr: Track, now: number): StreamLevel {
   const t = (now - tr.t0) / 1000
   let peak = 0, alive = true
+  // sys em 'auto': aos 6 s a chamada passa a tocar em outro dispositivo (troca automática, sem corte)
+  if (tr.auto && tr.dev.is_monitor && tr.switches === 0 && t >= 6) { tr.dev = DEVICES.find(d => d.name === 'fake_sink_2.monitor') ?? tr.dev; tr.switches = 1; tr.switchedAt = now }
   if (tr.dev.name === 'fake_mic_silent') peak = 0
   else if (tr.dev.is_monitor) peak = Math.floor(t / 5) % 3 === 2 ? 0 : Math.max(0, 0.3 + 0.2 * Math.sin(t * 1.7) + (Math.random() - 0.5) * 0.12)
   else peak = Math.max(0, 0.22 + 0.12 * Math.sin(t * 2.3) * Math.sin(t * 0.7) + (Math.random() - 0.5) * 0.08)
   if (tr.dev.name === 'fake_mic_flaky' && t >= 3 && t < 4.5) { alive = false; peak = 0; if (tr.cuts === 0) tr.cuts = 1 }
   if (peak < 0.01) tr.silentSince ??= now; else tr.silentSince = null
-  return { peak: Math.min(1, peak), rms: Math.min(1, peak * 0.62), silent_s: tr.silentSince ? (now - tr.silentSince) / 1000 : 0, alive }
+  return { peak: Math.min(1, peak), rms: Math.min(1, peak * 0.62), silent_s: tr.silentSince ? (now - tr.silentSince) / 1000 : 0, alive, switch_ago_s: tr.switchedAt == null ? null : (now - tr.switchedAt) / 1000 }
 }
 
 const streamStatus = (tr: Track | null, now: number): StreamStatus | null =>
-  tr ? { device: tr.dev.name, description: tr.dev.description, is_monitor: tr.dev.is_monitor, alive: !(tr.dev.name === 'fake_mic_flaky' && now - tr.t0 >= 3000 && now - tr.t0 < 4500), samples: Math.floor((now - tr.t0) * 16), cuts: tr.cuts } : null
+  tr ? { device: tr.dev.name, description: tr.dev.description, is_monitor: tr.dev.is_monitor, alive: !(tr.dev.name === 'fake_mic_flaky' && now - tr.t0 >= 3000 && now - tr.t0 < 4500), samples: Math.floor((now - tr.t0) * 16), cuts: tr.cuts, switches: tr.switches } : null
 
 function recInfo(): RecordingInfo | null {
   const c = rec.cur
@@ -712,7 +716,8 @@ function tick() {
   void emit('record-levels', ev)
   // corte/reconexão muda o estado (§9): o shell reemite `record-state` com `cuts` atualizado
   const cuts = (rec.cur?.mic?.cuts ?? 0) + (rec.cur?.sys?.cuts ?? 0)
-  if (rec.cur && cuts !== rec.lastCuts) { rec.lastCuts = cuts; pushState() }
+  const switches = (rec.cur?.mic?.switches ?? 0) + (rec.cur?.sys?.switches ?? 0)
+  if (rec.cur && (cuts !== rec.lastCuts || switches !== rec.lastSwitches)) { rec.lastCuts = cuts; rec.lastSwitches = switches; pushState() }
 }
 const ensureTicker = () => { rec.timer ??= setInterval(tick, 100) }
 
@@ -770,7 +775,7 @@ function startRecording(a: Args): RecordStatus {
   if (mt) mt.t0 = now
   if (st) st.t0 = now
   rec.cur = { key, started_at, startMs: now, intent, mic: mt, sys: st }
-  rec.lastCuts = 0
+  rec.lastCuts = 0; rec.lastSwitches = 0
   // save_last_used
   const set = (k: string, v: string | null) => { if (v == null) delete settings[k]; else settings[k] = v }
   set('record_library_id', String(intent.library_id)); set('record_client_id', intent.client_id == null ? null : String(intent.client_id))

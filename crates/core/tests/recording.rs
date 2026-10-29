@@ -204,7 +204,7 @@ fn finalized_flac_has_every_recorded_frame_and_the_sidecar_follows() {
     assert!(recording::scan_orphans(&app, None).unwrap().is_empty());
     // o "último usado" foi gravado pelo start
     let last = recording::last_used(&app).unwrap();
-    assert_eq!((last.library_id, last.mic, last.sys), (Some(app.inbox_id().unwrap()), StreamChoice::Default, StreamChoice::Default));
+    assert_eq!((last.library_id, last.mic, last.sys), (Some(app.inbox_id().unwrap()), StreamChoice::Auto, StreamChoice::Auto));
 }
 
 #[test]

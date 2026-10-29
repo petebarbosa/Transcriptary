@@ -72,7 +72,7 @@ pub mod keys {
     /// Último alvo usado: id da biblioteca (inbox incluída) e do cliente.
     pub const LIBRARY: &str = "record_library_id";
     pub const CLIENT: &str = "record_client_id";
-    /// Últimos dispositivos: JSON de `StreamChoice` (`"default"`, `"off"`, `{"named":"…"}`).
+    /// Últimos dispositivos: JSON de `StreamChoice` (`"auto"`, `"off"`, `{"named":"…"}`).
     pub const MIC: &str = "record_mic";
     pub const SYS: &str = "record_sys";
     /// Atalho global (acelerador do Tauri, ex.: `Ctrl+Alt+R`); ausente = padrão; `"none"` = desligado.

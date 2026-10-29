@@ -2,18 +2,16 @@
 // ao vivo (pré-visualização por `record_monitor_*` antes de gravar), iniciar/parar, edição durante a gravação
 // (`record_update`, sempre com o conjunto completo: o shell SUBSTITUI o intent) e progresso da finalização.
 // Regra de ouro: nunca redesenhar o formulário por evento; medidores/cronômetro/botões mudam no lugar.
-import { api, type DeviceInfo, type RecordDevices, type RecordInfo, type StreamChoice, type StreamLevel } from '../api'
+import { api, MIC_SILENCE_WARN_S, SWITCH_NOTE_S, SYS_SILENCE_WARN_S, type DeviceInfo, type RecordDevices, type RecordInfo, type StreamChoice, type StreamLevel } from '../api'
 import { t } from '../i18n'
 import { elapsedNow, hub, isRecording, progressFrac, stageLabel, startHub, subscribe } from '../rec'
 import { libName, store, type View } from '../store'
 import { describeError, inputCls } from '../dialogs'
 import { esc, fmtClock, fmtDateShort, fmtTime } from '../util'
 
-const SILENCE_WARN_S = 3 // mic sem áudio por tanto tempo → aviso (mudo ou dispositivo errado)
-
 // Seleção de dispositivo ⇄ valor do <select>
 const choiceToValue = (c: StreamChoice) => (typeof c === 'string' ? c : `dev:${c.named}`)
-const valueToChoice = (v: string): StreamChoice => (v === 'default' || v === 'off' ? v : { named: v.slice(4) })
+const valueToChoice = (v: string): StreamChoice => (v === 'auto' || v === 'off' ? v : { named: v.slice(4) })
 
 interface Form {
   libraryId: number; clientId: number | null; title: string; speakers: string; language: string
@@ -52,7 +50,7 @@ export async function renderRecord(el: HTMLElement): Promise<View> {
   const sysDevs = devs.devices.filter(d => d.is_monitor)
   const devOpts = (list: DeviceInfo[], cur: StreamChoice) => {
     const known = typeof cur === 'string' || list.some(d => d.name === cur.named)
-    return `<option value="default">${esc(t('record.dev_default'))}</option><option value="off">${esc(t('record.dev_off'))}</option>` +
+    return `<option value="auto">${esc(t('record.dev_auto'))}</option><option value="off">${esc(t('record.dev_off'))}</option>` +
       list.map(d => `<option value="dev:${esc(d.name)}">${esc(d.description || d.name)}${d.is_default ? ' · ' + esc(t('record.dev_is_default')) : ''}</option>`).join('') +
       (known ? '' : `<option value="dev:${esc((cur as { named: string }).named)}">${esc((cur as { named: string }).named)} · ${esc(t('record.dev_missing'))}</option>`)
   }
@@ -246,11 +244,14 @@ export async function renderRecord(el: HTMLElement): Promise<View> {
     box.classList.toggle('opacity-40', off)
     let msg = '', cls = 'text-zinc-500'
     if (off) msg = t('record.track_off')
+    else if (lv && lv.switch_ago_s != null && lv.switch_ago_s < SWITCH_NOTE_S) {
+      const st = hub.status?.recording?.[id]
+      msg = t('record.switched', { device: st?.description || st?.device || '' }); cls = 'text-sky-300'
+    }
     else if (lv && !lv.alive) { msg = t('record.reconnecting'); cls = 'text-amber-300' }
-    else if (lv && lv.silent_s >= SILENCE_WARN_S) {
+    else if (lv && lv.silent_s >= (id === 'mic' ? MIC_SILENCE_WARN_S : SYS_SILENCE_WARN_S)) {
       const s = Math.floor(lv.silent_s)
-      if (id === 'mic') { msg = t('record.mic_silent', { s }); cls = 'text-amber-300' }
-      else msg = t('record.sys_silent', { s })
+      msg = t(id === 'mic' ? 'record.mic_silent' : 'record.sys_silent', { s }); cls = 'text-amber-300'
     }
     note.textContent = msg
     note.className = `mt-1.5 min-h-4 text-xs ${cls}`

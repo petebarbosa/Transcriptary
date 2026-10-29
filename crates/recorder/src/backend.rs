@@ -50,6 +50,13 @@ pub trait CaptureBackend: Send + Sync {
     /// O fluxo devolvido **não precisa ser `Send`** (o `Simple` do libpulse não é): a sessão chama
     /// `open` dentro da própria thread de captura e só o backend cruza threads.
     fn open(&self, kind: DeviceKind, device: Option<&str>, fragment_ms: u32) -> Result<Box<dyn CaptureStream>>;
+
+    /// Nome da fonte monitor da saída que tem agora um fluxo de reprodução ativo (som saindo), ou `None`
+    /// se não souber / nenhuma estiver tocando. É o que o modo **auto** do `sys` grava. **Pode demorar**
+    /// (o backend real conecta ao servidor): nunca chame da thread de captura com um fluxo aberto.
+    fn active_monitor(&self) -> Option<String> {
+        None
+    }
 }
 
 pub trait CaptureStream {

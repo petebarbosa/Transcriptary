@@ -261,10 +261,10 @@ pub struct RecordArgs {
     /// Idioma da transcrição (pt, en, es...)
     #[arg(long)]
     language: Option<String>,
-    /// Microfone: nome do dispositivo (ver `record devices`), `default` ou `off`
+    /// Microfone: nome do dispositivo (ver `record devices`), `auto` (padrão do sistema; `default` também vale) ou `off`
     #[arg(long)]
     mic: Option<String>,
-    /// Áudio do sistema: nome do monitor (ver `record devices`), `default` ou `off`
+    /// Áudio do sistema: nome do monitor (ver `record devices`), `auto` (a saída que está tocando; `default` também vale) ou `off`
     #[arg(long)]
     sys: Option<String>,
 }
@@ -668,14 +668,14 @@ fn call(sock: &std::path::Path, req: &Request) -> core_lib::Result<serde_json::M
 
 fn parse_choice(s: &str) -> StreamChoice {
     match s {
-        "default" => StreamChoice::Default,
+        "auto" | "default" => StreamChoice::Auto, // `default`: sinônimo antigo
         "off" => StreamChoice::Off,
         name => StreamChoice::Named(name.to_string()),
     }
 }
 
 /// Resolve `--library`/`--client` (nome ou id) e monta o pedido. `fill_last`: para `toggle`, o que não
-/// foi dito vem do último uso (como no atalho global); `start` usa os padrões (inbox, `default`).
+/// foi dito vem do último uso (como no atalho global); `start` usa os padrões (inbox, `auto`).
 fn start_request(app: &App, a: &RecordArgs, fill_last: bool) -> core_lib::Result<StartRequest> {
     let (library_id, client_id) = match &a.library {
         Some(l) => {
@@ -1637,7 +1637,9 @@ mod tests {
         assert_eq!(out, "gravando: Reunião\n");
         let Request::RecordStart(req) = gui.seen.recv().unwrap() else { panic!() };
         assert_eq!((req.meta.library_id, req.meta.client_id, req.meta.expected_speakers), (Some(2), Some(1), Some(3)));
-        assert_eq!((req.mic, req.sys), (StreamChoice::Off, StreamChoice::Default));
+        assert_eq!((req.mic, req.sys), (StreamChoice::Off, StreamChoice::Auto));
+        // `auto` e o sinônimo antigo `default` dão o mesmo resultado
+        assert_eq!((parse_choice("auto"), parse_choice("default")), (StreamChoice::Auto, StreamChoice::Auto));
 
         // já gravando: o código do servidor volta como erro estável
         assert!(rec(rec_cmd(&["start"]), Lang::EnUs, false).is_err_and(|e| e.code() == "already_recording"));

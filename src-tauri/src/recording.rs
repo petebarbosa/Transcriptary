@@ -579,7 +579,7 @@ pub fn record_status(handle: AppHandle) -> R<Status> {
     Ok(status(&handle))
 }
 
-/// Começa a gravar. `mic`/`sys` ausentes = os últimos usados (padrão `"default"`); sem alvo = o último
+/// Começa a gravar. `mic`/`sys` ausentes = os últimos usados (padrão `"auto"`); sem alvo = o último
 /// alvo (senão Não classificadas). Salva "último usado" se deu certo e mostra a barra se
 /// `record_bar_on_start`. Erros: `already_recording`, `device_not_found`, `device_open_failed`,
 /// `backend_unavailable`, `invalid`, `not_found`.
@@ -727,9 +727,9 @@ mod tests {
     #[test]
     fn build_request_keeps_explicit_target_and_devices() {
         let meta = Meta { library_id: Some(1), ..Default::default() };
-        let r = build_request(&last(), meta, Some(StreamChoice::Default), None);
+        let r = build_request(&last(), meta, Some(StreamChoice::Auto), None);
         assert_eq!((r.meta.library_id, r.meta.client_id), (Some(1), None), "alvo explícito não herda o cliente do último uso");
-        assert_eq!((r.mic, r.sys), (StreamChoice::Default, StreamChoice::Off));
+        assert_eq!((r.mic, r.sys), (StreamChoice::Auto, StreamChoice::Off));
     }
 
     #[test]

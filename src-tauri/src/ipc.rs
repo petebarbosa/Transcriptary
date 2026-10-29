@@ -273,7 +273,7 @@ mod tests {
         let Request::RecordStart(s) = r else { panic!() };
         assert_eq!((s.meta.library_id, s.meta.client_id, s.meta.expected_speakers), (Some(2), Some(5), Some(3)));
         assert_eq!(s.mic, recorder::StreamChoice::Named("x".into()));
-        assert_eq!(s.sys, recorder::StreamChoice::Default);
+        assert_eq!(s.sys, recorder::StreamChoice::Auto);
         let r: Request = serde_json::from_str(r#"{"cmd":"record_start"}"#).unwrap();
         assert_eq!(r, Request::RecordStart(StartRequest::default()));
         let r: Request = serde_json::from_str(r#"{"cmd":"record_toggle"}"#).unwrap();

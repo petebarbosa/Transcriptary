@@ -11,6 +11,10 @@
 //!   nome sumiu, o padrão da categoria) preenchendo a lacuna com silêncio; reflete em `status()`.
 //! - 1ª leitura de cada trilha → `first_sample_unix_ms` (ver `CaptureStream::first_sample_time`) e
 //!   reescreve o sidecar (ainda `recording`).
+//! - `sys` em **auto**: grava o monitor da saída que está tocando (`backend.active_monitor()`), escolhido
+//!   no `open`/religar e **reavaliado durante a gravação**: uma thread observadora consulta o backend
+//!   (pode levar segundos: nunca na captura) e a captura só troca, pelo caminho de religar (corte
+//!   `auto_switch`), se a trilha está silenciosa há tempo e a última troca não foi há pouco.
 //! - `Drop` sem `stop()` = **aborta como uma queda**: threads param, WAVs/sidecar ficam como estão
 //!   (`state: "recording"`), recuperáveis.
 use std::path::{Path, PathBuf};
@@ -28,13 +32,15 @@ use crate::sidecar::{Cut, MIC_WAV, SCHEMA, SIDECAR_FILE, SYS_WAV, Sidecar, State
 use crate::wav::WavWriter;
 use crate::{Error, Result};
 
-/// Qual dispositivo usar numa trilha. JSON: `"default"` | `"off"` | `{"named": "<nome do dispositivo>"}`.
+/// Qual dispositivo usar numa trilha. JSON: `"auto"` | `"off"` | `{"named": "<nome do dispositivo>"}`
+/// (`"default"`, o nome antigo de `"auto"`, ainda é aceito).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StreamChoice {
-    /// Padrão do sistema (fonte padrão / monitor do sink padrão).
+    /// Mic: fonte padrão do sistema. Sys: monitor da saída que está tocando (o do sink padrão se nenhuma).
     #[default]
-    Default,
+    #[serde(alias = "default")]
+    Auto,
     /// Não gravar esta trilha (ex.: reunião presencial só com mic).
     Off,
     Named(String),
@@ -60,8 +66,8 @@ impl StartOptions {
         StartOptions {
             dir: dir.into(),
             key: key.into(),
-            mic: StreamChoice::Default,
-            sys: StreamChoice::Default,
+            mic: StreamChoice::Auto,
+            sys: StreamChoice::Auto,
             app_version: env!("CARGO_PKG_VERSION").to_string(),
             extra: serde_json::Value::Null,
             fragment_ms: 100,
@@ -78,7 +84,10 @@ pub struct StreamStatus {
     /// `false` enquanto desconectado e religando.
     pub alive: bool,
     pub samples: u64,
+    /// Cortes por falha de verdade (não conta as trocas automáticas de saída).
     pub cuts: u32,
+    /// Trocas automáticas de saída do `sys` (corte `auto_switch`): a fonte mudou, nada quebrou.
+    pub switches: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -98,6 +107,16 @@ const SYNC_EVERY: Duration = Duration::from_secs(1);
 const PATCH_EVERY: Duration = Duration::from_secs(5);
 /// Esperas entre tentativas de religar um fluxo que morreu (a última se repete).
 const RECONNECT_BACKOFF_MS: [u64; 4] = [100, 250, 500, 1000];
+/// Cadência com que o observador pergunta ao backend qual saída está tocando (no `sys` em auto).
+const AUTO_POLL: Duration = Duration::from_secs(2);
+/// Pico (i16) até o qual a trilha conta como silenciosa: o silêncio digital do monitor mede ~−91 dB (±1–2).
+const SILENT_PEAK: u16 = 16;
+/// O `sys` em auto só troca de saída depois de tanto silêncio contínuo, e não antes de tanto desde a
+/// última troca (um som de notificação em outro sink não provoca vai-e-vem). Em amostras, não em tempo de parede.
+const SWITCH_AFTER_SILENCE: u64 = 3 * SAMPLE_RATE as u64;
+const SWITCH_MIN_GAP: u64 = 5 * SAMPLE_RATE as u64;
+/// Motivo do corte da troca automática de saída (não é falha: `StreamStatus` conta à parte).
+const AUTO_SWITCH: &str = "auto_switch";
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -124,7 +143,7 @@ fn samples_to_ms(n: u64) -> u32 {
 /// Uma trilha em andamento: o que a thread de captura publica e o que `status`/`levels`/sidecar leem.
 struct Track {
     kind: DeviceKind,
-    /// `None` = padrão do sistema (segue o padrão ao religar); `Some` = dispositivo pedido por nome.
+    /// `None` = auto (mic: fonte padrão; sys: saída que toca, senão o padrão); `Some` = dispositivo pedido por nome.
     request: Option<String>,
     fragment_ms: u32,
     alive: AtomicBool,
@@ -134,18 +153,22 @@ struct Track {
     dirty: AtomicBool,
     meter: Mutex<LevelMeter>,
     meta: Mutex<StreamMeta>,
+    /// Monitor da saída que toca, como o observador viu por último (só `sys` em auto); a captura só lê.
+    candidate: Mutex<Option<String>>,
+    /// Início da última troca automática de saída (`auto_switch`); a UI mostra "trocando a fonte" por um tempo.
+    switched_at: Mutex<Option<Instant>>,
 }
 
 impl Track {
     fn new(kind: DeviceKind, choice: &StreamChoice, file: &str, fragment_ms: u32) -> Option<Arc<Track>> {
         let request = match choice {
             StreamChoice::Off => return None,
-            StreamChoice::Default => None,
+            StreamChoice::Auto => None,
             StreamChoice::Named(n) => Some(n.clone()),
         };
         let meta = StreamMeta {
             file: file.to_string(),
-            device: request.clone().unwrap_or_else(|| "default".into()),
+            device: request.clone().unwrap_or_else(|| "auto".into()),
             description: String::new(),
             is_monitor: kind == DeviceKind::Monitor,
             first_sample_unix_ms: None,
@@ -165,7 +188,14 @@ impl Track {
             dirty: AtomicBool::new(false),
             meter: Mutex::new(LevelMeter::default()),
             meta: Mutex::new(meta),
+            candidate: Mutex::new(None),
+            switched_at: Mutex::new(None),
         }))
+    }
+
+    /// `sys` em auto: a saída gravada segue a que está tocando.
+    fn is_auto_monitor(&self) -> bool {
+        self.kind == DeviceKind::Monitor && self.request.is_none()
     }
 
     fn samples(&self) -> u64 {
@@ -186,13 +216,18 @@ impl Track {
             is_monitor: m.is_monitor,
             alive: self.alive.load(Ordering::Relaxed),
             samples: self.samples(),
-            cuts: m.cuts.len() as u32,
+            cuts: m.cuts.iter().filter(|c| c.reason != AUTO_SWITCH).count() as u32,
+            switches: m.cuts.iter().filter(|c| c.reason == AUTO_SWITCH).count() as u32,
         }
     }
 
     fn level(&self) -> StreamLevel {
-        // `take` sempre diz `alive: true`; quem sabe é a trilha
-        StreamLevel { alive: self.alive.load(Ordering::Relaxed), ..lock(&self.meter).take() }
+        // `take` sempre diz `alive: true` e `switch_ago_s: None`; quem sabe é a trilha
+        StreamLevel {
+            alive: self.alive.load(Ordering::Relaxed),
+            switch_ago_s: lock(&self.switched_at).map(|t| t.elapsed().as_secs_f32()),
+            ..lock(&self.meter).take()
+        }
     }
 
     fn set_device(&self, info: &DeviceInfo) {
@@ -219,7 +254,15 @@ struct CaptureCtx {
 
 impl CaptureCtx {
     fn open(&self) -> Result<Box<dyn CaptureStream>> {
-        self.backend.open(self.track.kind, self.track.request.as_deref(), self.track.fragment_ms)
+        let (kind, frag) = (self.track.kind, self.track.fragment_ms);
+        // auto: a saída que toca agora (se ela sumiu entre a consulta e a abertura, o padrão)
+        if self.track.is_auto_monitor()
+            && let Some(name) = self.backend.active_monitor()
+            && let Ok(stream) = self.backend.open(kind, Some(&name), frag)
+        {
+            return Ok(stream);
+        }
+        self.backend.open(kind, self.track.request.as_deref(), frag)
     }
 
     fn stopped(&self) -> bool {
@@ -252,19 +295,23 @@ impl CaptureCtx {
         }
     }
 
-    /// Religa depois de uma falha: tenta o dispositivo pedido; se ele sumiu, o padrão da categoria.
-    /// `None` = a sessão parou antes de conseguir.
-    fn reconnect(&self) -> Option<Box<dyn CaptureStream>> {
+    /// Religa depois de uma falha: tenta `prefer` (a saída para onde o auto decidiu trocar), senão o
+    /// dispositivo pedido; se ele sumiu, o padrão da categoria. `None` = a sessão parou antes de conseguir.
+    fn reconnect(&self, prefer: Option<&str>) -> Option<Box<dyn CaptureStream>> {
         for attempt in 0.. {
             self.nap(RECONNECT_BACKOFF_MS[attempt.min(RECONNECT_BACKOFF_MS.len() - 1)]);
             if self.stopped() {
                 return None;
             }
-            let opened = match self.open() {
-                Err(Error::DeviceNotFound(_)) if self.track.request.is_some() => {
-                    self.backend.open(self.track.kind, None, self.track.fragment_ms)
-                }
-                other => other,
+            let preferred = prefer.map(|n| self.backend.open(self.track.kind, Some(n), self.track.fragment_ms));
+            let opened = match preferred {
+                Some(Ok(stream)) => Ok(stream),
+                _ => match self.open() {
+                    Err(Error::DeviceNotFound(_)) if self.track.request.is_some() => {
+                        self.backend.open(self.track.kind, None, self.track.fragment_ms)
+                    }
+                    other => other,
+                },
             };
             if let Ok(stream) = opened {
                 return Some(stream);
@@ -294,6 +341,36 @@ fn first_read(stream: &dyn CaptureStream, got: usize) -> (Instant, SystemTime, O
     (now.checked_sub(back).unwrap_or(now), sys_now.checked_sub(back).unwrap_or(sys_now), latency)
 }
 
+/// Abre um corte: o fluxo atual deixa de valer (morreu ou vai ser trocado) e a captura passa a religar.
+/// `reconnected`/`gap_ms` são completados quando religa (ou ao parar).
+fn begin_cut(track: &Track, reason: &str) {
+    track.alive.store(false, Ordering::SeqCst);
+    if reason == AUTO_SWITCH {
+        *lock(&track.switched_at) = Some(Instant::now());
+    }
+    lock(&track.meta).cuts.push(Cut {
+        at_sample: track.samples(),
+        at_unix_ms: unix_ms(SystemTime::now()),
+        gap_ms: 0,
+        reason: reason.into(),
+        reconnected: false,
+    });
+    track.dirty.store(true, Ordering::SeqCst);
+}
+
+/// Observador do `sys` em auto: publica em `track.candidate` o monitor da saída que toca. Thread própria
+/// porque `active_monitor()` pode levar segundos e a captura não pode parar de ler. Não é aguardada no
+/// `shutdown` (nem deve atrasá-lo): só segura o backend e a trilha e acaba sozinha ao ver `stop`.
+fn observer_thread(ctx: CaptureCtx) {
+    loop {
+        ctx.nap(AUTO_POLL.as_millis() as u64);
+        if ctx.stopped() {
+            return;
+        }
+        *lock(&ctx.track.candidate) = ctx.backend.active_monitor();
+    }
+}
+
 fn capture_thread(ctx: CaptureCtx, opened: mpsc::Sender<Result<()>>) {
     let track = ctx.track.clone();
     let mut stream = match ctx.open() {
@@ -312,11 +389,14 @@ fn capture_thread(ctx: CaptureCtx, opened: mpsc::Sender<Result<()>>) {
     let mut clock: Option<TrackClock> = None;
     let mut fresh = true; // a próxima leitura é a primeira do fluxo atual
     let mut cut_started: Option<Instant> = None; // desconectado desde...
+    let mut quiet: u64 = 0; // amostras silenciosas seguidas (para o auto)
+    let mut last_switch: Option<u64> = None; // amostra do último corte `auto_switch` provocado pelo auto
+    let mut switch_to: Option<String> = None; // saída para onde o auto decidiu trocar
 
     while !ctx.stopped() {
         let Some(s) = stream.as_mut() else {
             // desconectado: religa (bloqueia até conseguir ou parar)
-            stream = ctx.reconnect();
+            stream = ctx.reconnect(switch_to.take().as_deref());
             fresh = true;
             continue;
         };
@@ -326,18 +406,8 @@ fn capture_thread(ctx: CaptureCtx, opened: mpsc::Sender<Result<()>>) {
             }
             // o fluxo morreu: registra o corte e passa a religar
             stream = None;
-            track.alive.store(false, Ordering::SeqCst);
             cut_started = Some(Instant::now());
-            let mut m = lock(&track.meta);
-            m.cuts.push(Cut {
-                at_sample: track.samples(),
-                at_unix_ms: unix_ms(SystemTime::now()),
-                gap_ms: 0,
-                reason: "read_error".into(),
-                reconnected: false,
-            });
-            drop(m);
-            track.dirty.store(true, Ordering::SeqCst);
+            begin_cut(&track, "read_error");
             continue;
         }
         if fresh {
@@ -365,7 +435,8 @@ fn capture_thread(ctx: CaptureCtx, opened: mpsc::Sender<Result<()>>) {
                     if let Some(cut) = m.cuts.last_mut() {
                         cut.gap_ms = samples_to_ms(gap);
                         cut.reconnected = true;
-                        if changed {
+                        // a troca automática já nasceu com o motivo certo; só uma falha que religou noutro vira `device_changed`
+                        if changed && cut.reason != AUTO_SWITCH {
                             cut.reason = "device_changed".into();
                         }
                     }
@@ -383,6 +454,21 @@ fn capture_thread(ctx: CaptureCtx, opened: mpsc::Sender<Result<()>>) {
         lock(&track.meter).push(&buf);
         ctx.send(buf.clone());
         track.samples.fetch_add(buf.len() as u64, Ordering::Relaxed);
+
+        if track.is_auto_monitor() {
+            // só compara o que o observador publicou: nada que bloqueie a leitura
+            quiet = if buf.iter().all(|v| v.unsigned_abs() <= SILENT_PEAK) { quiet + buf.len() as u64 } else { 0 };
+            let now = track.samples();
+            let ready = quiet >= SWITCH_AFTER_SILENCE && last_switch.is_none_or(|at| now - at >= SWITCH_MIN_GAP);
+            let target = lock(&track.candidate).clone().filter(|c| ready && *c != s.device().name);
+            if let Some(name) = target {
+                // a saída que toca não é a gravada e a gravada está muda: troca pelo caminho de religar
+                stream = None;
+                cut_started = Some(Instant::now());
+                begin_cut(&track, AUTO_SWITCH);
+                (switch_to, last_switch, quiet) = (Some(name), Some(now), 0);
+            }
+        }
     }
 
     // parou desconectado: a trilha continua do tamanho do tempo decorrido
@@ -603,6 +689,10 @@ impl Session {
         if let Some(e) = first_err {
             session.shutdown(true);
             return Err(e);
+        }
+        for track in shared.tracks().filter(|t| t.is_auto_monitor()) {
+            let ctx = CaptureCtx { backend: backend.clone(), track: track.clone(), stop: stop.clone(), tx: None };
+            std::thread::Builder::new().name("rec-observer".into()).spawn(move || observer_thread(ctx))?;
         }
         shared.persist_with(|_| {})?; // agora com o dispositivo efetivo
         Ok(session)

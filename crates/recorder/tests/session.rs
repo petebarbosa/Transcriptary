@@ -88,6 +88,7 @@ fn flaky_mic_reconnects_and_records_a_cut() {
 
 // ------------------------------------------------------------------ mais cenários
 
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use recorder::{CaptureBackend, CaptureStream, DeviceInfo, DeviceKind, Error, Monitor};
@@ -208,14 +209,14 @@ fn levels_report_peak_rms_and_digital_silence() {
 fn monitor_measures_levels_and_writes_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let before = std::fs::read_dir(dir.path()).unwrap().count();
-    let m = Monitor::start(Arc::new(FakeBackend::new()), &StreamChoice::Default, &StreamChoice::Off).unwrap();
+    let m = Monitor::start(Arc::new(FakeBackend::new()), &StreamChoice::Auto, &StreamChoice::Off).unwrap();
     std::thread::sleep(Duration::from_millis(500));
     let l = m.levels();
     assert!(l.sys.is_none() && l.mic.unwrap().peak > 0.2);
     m.stop();
     assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), before);
 
-    let err = Monitor::start(Arc::new(FakeBackend::fast()), &StreamChoice::Named("nope".into()), &StreamChoice::Default).err().unwrap();
+    let err = Monitor::start(Arc::new(FakeBackend::fast()), &StreamChoice::Named("nope".into()), &StreamChoice::Auto).err().unwrap();
     assert_eq!(err.code(), "device_not_found");
 }
 
@@ -344,4 +345,162 @@ fn handles_can_cross_threads() {
     fn send<T: Send>() {}
     send::<Session>();
     send::<Monitor>();
+}
+
+// ------------------------------------------------------------------ sys em modo auto: segue a saída que está tocando
+
+/// Nomes inventados: o padrão do sistema entrega silêncio digital (nada toca nele e não dá erro, como o
+/// monitor do sink padrão quando a chamada sai por outra placa); o outro é onde o som realmente sai.
+const MON_DEFAULT: &str = "mon_default.monitor";
+const MON_ACTIVE: &str = "mon_active.monitor";
+
+/// Dois monitores e um `active_monitor()` que o teste move à vontade. Entrega áudio 4× mais rápido que
+/// o tempo real (a sessão conta amostras, não relógio de parede).
+struct TwoSinks {
+    active: Mutex<Option<String>>,
+    /// `true`: o monitor padrão também entrega tom (não está silencioso).
+    default_tone: bool,
+}
+
+struct TwoSinksStream {
+    info: DeviceInfo,
+    tone: bool,
+    produced: u64,
+}
+
+impl TwoSinks {
+    fn new(active: Option<&str>, default_tone: bool) -> Arc<TwoSinks> {
+        Arc::new(TwoSinks { active: Mutex::new(active.map(Into::into)), default_tone })
+    }
+
+    fn set_active(&self, name: &str) {
+        *self.active.lock().unwrap() = Some(name.into());
+    }
+
+    fn monitors() -> Vec<DeviceInfo> {
+        let m = |name: &str, is_default| DeviceInfo { name: name.into(), description: format!("{name} desc"), is_monitor: true, is_default };
+        vec![m(MON_DEFAULT, true), m(MON_ACTIVE, false)]
+    }
+}
+
+impl CaptureBackend for TwoSinks {
+    fn id(&self) -> &'static str {
+        "fake"
+    }
+    fn list_devices(&self) -> recorder::Result<Vec<DeviceInfo>> {
+        Ok(Self::monitors())
+    }
+    fn open(&self, _kind: DeviceKind, device: Option<&str>, _fragment_ms: u32) -> recorder::Result<Box<dyn CaptureStream>> {
+        let info = match device {
+            Some(n) => Self::monitors().into_iter().find(|d| d.name == n).ok_or_else(|| Error::DeviceNotFound(n.into()))?,
+            None => Self::monitors().remove(0),
+        };
+        let tone = info.name == MON_ACTIVE || self.default_tone;
+        Ok(Box::new(TwoSinksStream { info, tone, produced: 0 }))
+    }
+    fn active_monitor(&self) -> Option<String> {
+        self.active.lock().unwrap().clone()
+    }
+}
+
+impl CaptureStream for TwoSinksStream {
+    fn device(&self) -> &DeviceInfo {
+        &self.info
+    }
+    fn read(&mut self, buf: &mut [i16]) -> recorder::Result<()> {
+        for (i, out) in buf.iter_mut().enumerate() {
+            let n = (self.produced + i as u64) as f64;
+            *out = if self.tone { ((2.0 * std::f64::consts::PI * 880.0 * n / 16_000.0).sin() * 8000.0) as i16 } else { 0 };
+        }
+        self.produced += buf.len() as u64;
+        std::thread::sleep(Duration::from_millis(buf.len() as u64 * 1000 / 16_000 / 4));
+        Ok(())
+    }
+    fn latency(&self) -> Option<Duration> {
+        Some(Duration::from_millis(30))
+    }
+}
+
+/// Só a trilha `sys`, em modo auto (o padrão).
+fn auto_sys_session(backend: Arc<TwoSinks>, dir: &std::path::Path) -> Session {
+    let mut opts = StartOptions::new(dir, "call_2026-10-02_11-00-00");
+    opts.mic = StreamChoice::Off;
+    opts.sys = StreamChoice::Auto;
+    Session::start(backend, opts).unwrap()
+}
+
+fn peak(s: &[i16]) -> u16 {
+    s.iter().map(|v| v.unsigned_abs()).max().unwrap_or(0)
+}
+
+fn wait_until(secs: u64, mut done: impl FnMut() -> bool) {
+    let until = std::time::Instant::now() + Duration::from_secs(secs);
+    while !done() && std::time::Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn auto_sys_records_the_output_that_is_playing_from_the_start() {
+    // o monitor do sink padrão fica mudo; a chamada sai pelo outro
+    let dir = tempfile::tempdir().unwrap();
+    let rec = dir.path().join("rec");
+    let session = auto_sys_session(TwoSinks::new(Some(MON_ACTIVE), false), &rec);
+    std::thread::sleep(Duration::from_millis(1000));
+    let sc = session.stop().unwrap();
+    let sys = sc.sys.unwrap();
+    assert_eq!(sys.device, MON_ACTIVE, "sys silencioso: gravou o monitor padrão em vez do que toca");
+    assert!(sys.cuts.is_empty());
+    let samples = read_samples(&rec.join(SYS_WAV));
+    assert!(peak(&samples[samples.len() - 8_000..]) > 1_000, "sys silencioso");
+}
+
+#[test]
+fn auto_sys_follows_the_output_when_the_call_starts_after_recording() {
+    // aperta gravar, depois entra na chamada: no início só o padrão "toca" (mudo); depois o som sai pelo outro
+    let dir = tempfile::tempdir().unwrap();
+    let rec = dir.path().join("rec");
+    let backend = TwoSinks::new(Some(MON_DEFAULT), false);
+    let session = auto_sys_session(backend.clone(), &rec);
+    assert_eq!(session.status().sys.unwrap().device, MON_DEFAULT);
+    std::thread::sleep(Duration::from_millis(300));
+    backend.set_active(MON_ACTIVE);
+    wait_until(10, || session.status().sys.is_some_and(|s| s.switches == 1 && s.alive));
+    std::thread::sleep(Duration::from_millis(500));
+    // a troca automática não é falha: não entra em `cuts`, e a UI sabe há quanto tempo ela começou
+    let st = session.status().sys.unwrap();
+    assert_eq!((st.cuts, st.switches), (0, 1), "{st:?}");
+    let ago = session.levels().sys.unwrap().switch_ago_s;
+    assert!(ago.is_some_and(|s| (0.4..5.0).contains(&s)), "switch_ago_s = {ago:?}");
+    let sc = session.stop().unwrap();
+    let sys = sc.sys.unwrap();
+    assert_eq!(sys.device, MON_ACTIVE, "device não trocou: sys ficou silencioso");
+    assert_eq!((sys.cuts.len(), sys.reconnects), (1, 1));
+    assert_eq!(sys.cuts[0].reason, "auto_switch");
+    let samples = read_samples(&rec.join(SYS_WAV));
+    assert!(peak(&samples[samples.len() - 8_000..]) > 1_000, "sys silencioso");
+    assert!(peak(&samples[..sys.cuts[0].at_sample as usize]) <= 2, "antes da troca era silêncio digital");
+}
+
+#[test]
+fn auto_sys_does_not_switch_while_the_current_output_is_audible() {
+    // um som em outro sink (ex.: notificação) não tira a gravação de uma saída que está soando
+    let dir = tempfile::tempdir().unwrap();
+    let backend = TwoSinks::new(Some(MON_DEFAULT), true);
+    let session = auto_sys_session(backend.clone(), &dir.path().join("rec"));
+    std::thread::sleep(Duration::from_millis(300));
+    backend.set_active(MON_ACTIVE);
+    std::thread::sleep(Duration::from_millis(3500)); // passa por pelo menos uma consulta do observador
+    let st = session.status().sys.unwrap();
+    assert_eq!((st.device.as_str(), st.cuts), (MON_DEFAULT, 0));
+    session.stop().unwrap();
+}
+
+#[test]
+fn stream_choice_serializes_auto_and_still_reads_the_old_default() {
+    assert_eq!(serde_json::to_string(&StreamChoice::Auto).unwrap(), r#""auto""#);
+    for old in [r#""default""#, r#""auto""#] {
+        assert_eq!(serde_json::from_str::<StreamChoice>(old).unwrap(), StreamChoice::Auto);
+    }
+    assert_eq!(serde_json::from_str::<StreamChoice>(r#"{"named":"x"}"#).unwrap(), StreamChoice::Named("x".into()));
 }

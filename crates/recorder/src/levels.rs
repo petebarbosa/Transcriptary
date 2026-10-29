@@ -14,6 +14,8 @@ pub struct StreamLevel {
     pub silent_s: f32,
     /// `false` enquanto o fluxo está desconectado e a sessão tenta religar.
     pub alive: bool,
+    /// Segundos desde o início da última troca automática de saída do `sys` (`None` = nunca houve).
+    pub switch_ago_s: Option<f32>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
@@ -52,6 +54,7 @@ impl LevelMeter {
             rms: rms as f32,
             silent_s: self.silent_run as f32 / SAMPLE_RATE as f32,
             alive: true,
+            switch_ago_s: None,
         };
         self.sum_sq = 0.0;
         self.count = 0;

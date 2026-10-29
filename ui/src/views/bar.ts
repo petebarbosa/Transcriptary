@@ -3,7 +3,7 @@
 // A janela (~320x56, sem decoração, sempre no topo) só tem `core:event:default` + `start-dragging`; por isso aqui
 // só se ouvem `record-state` e `record-levels`, e os comandos usados são os próprios do app (`record_*`, `bar_hide`,
 // `show_main_window`). Arrastar: `data-tauri-drag-region` no contêiner e nos textos, nunca nos botões.
-import { api } from '../api'
+import { api, MIC_SILENCE_WARN_S, SYS_SILENCE_WARN_S } from '../api'
 import { t } from '../i18n'
 import { elapsedNow, hub, isRecording, startHub, subscribe } from '../rec'
 import { describeError } from '../dialogs'
@@ -62,10 +62,10 @@ export async function renderBar(el: HTMLElement): Promise<void> {
       smooth[id] = target > smooth[id] ? target : smooth[id] * 0.8 + target * 0.2
       const m = $(`[data-m="${id}"]`), fill = m.firstElementChild as HTMLElement
       fill.style.width = `${(smooth[id] * 100).toFixed(1)}%`
-      // mic parado há alguns segundos: âmbar (o mesmo aviso da tela principal, em miniatura)
-      const warn = id === 'mic' && !!v && v.silent_s >= 3
+      // trilha parada há alguns segundos (mic 3 s, sys 10 s): âmbar (o mesmo aviso da tela principal, em miniatura)
+      const warn = !!v && v.silent_s >= (id === 'mic' ? MIC_SILENCE_WARN_S : SYS_SILENCE_WARN_S)
       fill.className = `absolute inset-y-0 left-0 rounded-full ${warn ? 'bg-amber-400/80' : 'bg-emerald-400/80'}`
-      m.title = warn ? t('record.mic_silent', { s: Math.floor(v!.silent_s) }) : ''
+      m.title = warn ? t(id === 'mic' ? 'record.mic_silent' : 'record.sys_silent', { s: Math.floor(v!.silent_s) }) : ''
     }
   }
   const fail = (e: unknown) => {

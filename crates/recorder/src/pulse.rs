@@ -6,6 +6,9 @@
 //!   16000 Hz}, None, BufferAttr{fragsize = fragment_ms})`: reamostragem/mistura feitas pelo servidor.
 //!   `read` bloqueia até preencher o buffer; `get_latency()` dá a latência (às vezes 0 = indisponível).
 //! - Sem `libpulse-dev`: o `libpulse-sys` cai no fallback `libpulse.so.0` (só `libpulse0` em runtime).
+//! - **Saída ativa** (`active_monitor`, o modo auto do `sys`): não se usa o estado do sink (RUNNING/IDLE) e
+//!   sim os *sink-inputs* (fluxos de reprodução) não pausados, cruzados com os sinks pelo índice; os fluxos
+//!   do próprio app (o player) não contam. O monitor vem do campo `monitor_source_name` do sink.
 //! - Risco conhecido: o fluxo fica preso ao dispositivo resolvido na abertura; se o sink padrão mudar
 //!   ou o dispositivo sumir o `read` falha → a sessão religa e registra um corte.
 use std::cell::RefCell;
@@ -16,6 +19,7 @@ use libpulse_binding::callbacks::ListResult;
 use libpulse_binding::context::{Context, FlagSet, State as CtxState};
 use libpulse_binding::def::BufferAttr;
 use libpulse_binding::mainloop::standard::{IterateResult, Mainloop};
+use libpulse_binding::proplist::properties;
 use libpulse_binding::sample::{Format, Spec};
 use libpulse_binding::stream::Direction;
 use libpulse_simple_binding::Simple;
@@ -42,14 +46,31 @@ impl PulseBackend {
     }
 }
 
-/// O que o servidor diz agora: padrões e todas as fontes (microfones e monitores).
+/// Uma saída (sink) e a fonte monitor dela, como o servidor informou.
+struct Output {
+    index: u32,
+    name: String,
+    monitor: Option<String>,
+}
+
+/// O que o servidor diz agora: padrões, todas as fontes (microfones e monitores) e quem está tocando.
 struct Snapshot {
     default_source: Option<String>,
     default_sink: Option<String>,
     sources: Vec<DeviceInfo>,
+    outputs: Vec<Output>,
+    /// Índices dos sinks com algum fluxo de reprodução ativo (não pausado) de outro app.
+    playing: Vec<u32>,
 }
 
 impl Snapshot {
+    /// Monitor da saída com som saindo: a do sink padrão se tem fluxo ativo, senão a 1ª que tiver.
+    fn active_monitor(&self) -> Option<String> {
+        let mut playing = self.outputs.iter().filter(|o| o.monitor.is_some() && self.playing.contains(&o.index));
+        let default = playing.clone().find(|o| self.default_sink.as_deref() == Some(o.name.as_str()));
+        default.or_else(|| playing.next()).and_then(|o| o.monitor.clone())
+    }
+
     fn monitor_default_name(&self) -> Option<String> {
         self.default_sink.as_ref().map(|s| format!("{s}.monitor"))
     }
@@ -95,7 +116,7 @@ fn unavailable(what: impl std::fmt::Display) -> Error {
 /// `(fonte padrão, sink padrão)` como o servidor informou.
 type Defaults = (Option<String>, Option<String>);
 
-/// Conecta, lê servidor + fontes e desconecta. Mainloop próprio e de vida curta (não é `Send`).
+/// Conecta, lê servidor + fontes + sinks + fluxos de reprodução e desconecta. Mainloop próprio e de vida curta (não é `Send`).
 fn snapshot() -> Result<Snapshot> {
     let mut ml = Mainloop::new().ok_or_else(|| unavailable("could not create mainloop"))?;
     let mut ctx = Context::new(&ml, APP_NAME).ok_or_else(|| unavailable("could not create context"))?;
@@ -146,14 +167,39 @@ fn snapshot() -> Result<Snapshot> {
             ListResult::End | ListResult::Error => *out.borrow_mut() = Some(std::mem::take(&mut *acc.borrow_mut())),
         })
     };
-    while defaults.borrow().is_none() || sources.borrow().is_none() {
+    let outputs: Rc<RefCell<Option<Vec<Output>>>> = Rc::default();
+    let op3 = {
+        let (out, acc) = (outputs.clone(), Rc::new(RefCell::new(Vec::new())));
+        ctx.introspect().get_sink_info_list(move |r| match r {
+            ListResult::Item(s) => {
+                let own = |c: &Option<std::borrow::Cow<'_, str>>| c.as_ref().map(|s| s.to_string()).filter(|s| !s.is_empty());
+                acc.borrow_mut().push(Output { index: s.index, name: own(&s.name).unwrap_or_default(), monitor: own(&s.monitor_source_name) });
+            }
+            ListResult::End | ListResult::Error => *out.borrow_mut() = Some(std::mem::take(&mut *acc.borrow_mut())),
+        })
+    };
+    let playing: Rc<RefCell<Option<Vec<u32>>>> = Rc::default();
+    let op4 = {
+        let (out, acc) = (playing.clone(), Rc::new(RefCell::new(Vec::new())));
+        ctx.introspect().get_sink_input_info_list(move |r| match r {
+            ListResult::Item(i) => {
+                if !i.corked && i.proplist.get_str(properties::APPLICATION_NAME).as_deref() != Some(APP_NAME) {
+                    acc.borrow_mut().push(i.sink);
+                }
+            }
+            ListResult::End | ListResult::Error => *out.borrow_mut() = Some(std::mem::take(&mut *acc.borrow_mut())),
+        })
+    };
+    while defaults.borrow().is_none() || sources.borrow().is_none() || outputs.borrow().is_none() || playing.borrow().is_none() {
         spin(&mut ml)?;
     }
-    drop((op1, op2));
+    drop((op1, op2, op3, op4));
     ctx.disconnect();
     let (default_source, default_sink) = defaults.borrow_mut().take().unwrap_or_default();
     let sources = sources.borrow_mut().take().unwrap_or_default();
-    Ok(Snapshot { default_source, default_sink, sources })
+    let outputs = outputs.borrow_mut().take().unwrap_or_default();
+    let playing = playing.borrow_mut().take().unwrap_or_default();
+    Ok(Snapshot { default_source, default_sink, sources, outputs, playing })
 }
 
 impl CaptureBackend for PulseBackend {
@@ -163,6 +209,10 @@ impl CaptureBackend for PulseBackend {
 
     fn list_devices(&self) -> Result<Vec<DeviceInfo>> {
         Ok(snapshot()?.devices())
+    }
+
+    fn active_monitor(&self) -> Option<String> {
+        snapshot().ok()?.active_monitor()
     }
 
     fn open(&self, kind: DeviceKind, device: Option<&str>, fragment_ms: u32) -> Result<Box<dyn CaptureStream>> {
@@ -274,11 +324,17 @@ mod tests {
         DeviceInfo { name: name.into(), description: name.into(), is_monitor, is_default: false }
     }
 
+    fn out(index: u32, name: &str) -> Output {
+        Output { index, name: name.into(), monitor: Some(format!("{name}.monitor")) }
+    }
+
     fn snap(default_source: Option<&str>, default_sink: Option<&str>) -> Snapshot {
         Snapshot {
             default_source: default_source.map(Into::into),
             default_sink: default_sink.map(Into::into),
             sources: vec![dev("mic_a", false), dev("mic_b", false), dev("out_a.monitor", true), dev("out_b.monitor", true)],
+            outputs: vec![out(0, "out_a"), out(1, "out_b")],
+            playing: vec![],
         }
     }
 
@@ -301,7 +357,58 @@ mod tests {
         let odd = snap(Some("out_a.monitor"), None);
         assert_eq!(odd.resolve(DeviceKind::Mic, None).unwrap().name, "mic_a");
         assert_eq!(odd.resolve(DeviceKind::Monitor, None).unwrap().name, "out_a.monitor");
-        let none = Snapshot { default_source: None, default_sink: None, sources: vec![dev("mic_a", false)] };
+        let none = Snapshot { default_source: None, default_sink: None, sources: vec![dev("mic_a", false)], outputs: vec![], playing: vec![] };
         assert_eq!(none.resolve(DeviceKind::Monitor, None).unwrap_err().code(), "device_not_found");
+    }
+
+    #[test]
+    fn active_monitor_prefers_the_default_sink_then_the_first_playing() {
+        let mut s = snap(None, Some("out_b"));
+        assert_eq!(s.active_monitor(), None, "ninguém tocando");
+        s.playing = vec![0];
+        assert_eq!(s.active_monitor().as_deref(), Some("out_a.monitor"), "só a outra saída toca");
+        s.playing = vec![0, 1, 1];
+        assert_eq!(s.active_monitor().as_deref(), Some("out_b.monitor"), "o padrão ganha quando também toca");
+        s.default_sink = None;
+        assert_eq!(s.active_monitor().as_deref(), Some("out_a.monitor"), "sem padrão: a 1ª que toca");
+        s.playing = vec![7]; // fluxo num sink que não conhecemos
+        assert_eq!(s.active_monitor(), None);
+        s.outputs[0].monitor = None;
+        s.playing = vec![0];
+        assert_eq!(s.active_monitor(), None, "sink sem fonte monitor não serve");
+    }
+
+    /// Verificação **manual** (`cargo test -p tary-recorder --lib -- --ignored`): um fluxo de reprodução real
+    /// (`paplay` com zeros: não faz barulho, mas é um sink-input ativo) no sink padrão.
+    #[test]
+    #[ignore = "precisa de PulseAudio/PipeWire e do paplay; nada mais pode estar tocando"]
+    fn live_active_monitor_follows_a_playing_stream() {
+        use std::process::{Child, Command, Stdio};
+        struct Kill(Child);
+        impl Drop for Kill {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let backend = PulseBackend::new();
+        let default_monitor = backend.list_devices().unwrap().into_iter().find(|d| d.is_monitor && d.is_default).unwrap().name;
+        assert_eq!(backend.active_monitor(), None, "sem nada tocando");
+        let child = Command::new("paplay")
+            .args(["--raw", "--rate=16000", "--format=s16le", "--channels=1", "/dev/zero"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let _guard = Kill(child);
+        let mut seen = None;
+        for _ in 0..20 {
+            std::thread::sleep(Duration::from_millis(250));
+            seen = backend.active_monitor();
+            if seen.is_some() {
+                break;
+            }
+        }
+        assert_eq!(seen, Some(default_monitor), "tocando no sink padrão");
     }
 }
